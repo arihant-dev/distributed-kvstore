@@ -1,0 +1,13 @@
+# Binaries
+/traffic-sim/traffic-sim
+/orchestrator/orchestrator
+/chaos-agent/chaos-agent
+
+# Reports & Scores
+*.json
+report.json
+score.json
+
+# Temporary files
+*_wal.log
+.DS_Store
