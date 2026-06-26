@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,7 +37,7 @@ type Node struct {
 	mu sync.RWMutex
 
 	id    string
-	peers []string // gRPC addresses of other nodes
+	peers map[string]string // nodeID -> gRPC address (e.g. "node2" -> "node2:9082")
 
 	role        Role
 	currentTerm uint64
@@ -50,7 +51,18 @@ type Node struct {
 }
 
 // NewNode initializes a new server node
-func NewNode(id string, peers []string, s *store.Store) *Node {
+func NewNode(id string, peersList []string, s *store.Store) *Node {
+	peers := make(map[string]string)
+	for _, p := range peersList {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		parts := strings.Split(p, ":")
+		peerID := parts[0]
+		peers[peerID] = p
+	}
+
 	return &Node{
 		id:            id,
 		peers:         peers,
@@ -211,7 +223,10 @@ func (n *Node) startElection() {
 
 	term := n.currentTerm
 	lastLogIndex := n.store.GetIndex()
-	peers := n.peers
+	var peers []string
+	for _, p := range n.peers {
+		peers = append(peers, p)
+	}
 	n.mu.Unlock()
 
 	votes := 1 // We vote for ourselves
@@ -279,7 +294,10 @@ func (n *Node) heartbeatTicker() {
 
 		term := n.currentTerm
 		leaderID := n.id
-		peers := n.peers
+		var peers []string
+		for _, p := range n.peers {
+			peers = append(peers, p)
+		}
 		n.mu.RUnlock()
 
 		req := &proto.AppendEntriesRequest{
@@ -319,7 +337,7 @@ func (n *Node) attemptRecoverySync() {
 
 	log.Printf("Node %s: attempting recovery sync (local index: %d)", n.id, myIndex)
 
-	for _, peer := range n.peers {
+	for _, peer := range n.GetPeers() {
 		conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			continue
@@ -395,7 +413,27 @@ func (n *Node) GetRoleString() string {
 }
 
 func (n *Node) GetPeers() []string {
-	return n.peers
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	var addrs []string
+	for _, addr := range n.peers {
+		addrs = append(addrs, addr)
+	}
+	return addrs
+}
+
+func (n *Node) AddPeer(peerID, address string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.peers[peerID] = address
+	log.Printf("Node %s: Peer %s (%s) added to membership", n.id, peerID, address)
+}
+
+func (n *Node) RemovePeer(peerID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.peers, peerID)
+	log.Printf("Node %s: Peer %s removed from membership", n.id, peerID)
 }
 
 func (n *Node) GetLeaderHTTPAddress() string {
@@ -428,7 +466,10 @@ func (n *Node) ReplicateEntry(op store.OpType, key string, val []byte) bool {
 	}
 	term := n.currentTerm
 	leaderID := n.id
-	peers := n.peers
+	var peers []string
+	for _, p := range n.peers {
+		peers = append(peers, p)
+	}
 	index := n.store.GetIndex()
 	n.mu.RUnlock()
 
