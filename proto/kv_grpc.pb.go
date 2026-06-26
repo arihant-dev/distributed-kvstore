@@ -22,6 +22,9 @@ const (
 	Replication_AppendEntries_FullMethodName = "/proto.Replication/AppendEntries"
 	Replication_RequestVote_FullMethodName   = "/proto.Replication/RequestVote"
 	Replication_SyncWAL_FullMethodName       = "/proto.Replication/SyncWAL"
+	Replication_Join_FullMethodName          = "/proto.Replication/Join"
+	Replication_Leave_FullMethodName         = "/proto.Replication/Leave"
+	Replication_UpdatePeers_FullMethodName   = "/proto.Replication/UpdatePeers"
 )
 
 // ReplicationClient is the client API for Replication service.
@@ -40,6 +43,12 @@ type ReplicationClient interface {
 	// it missed while it was down. The follower sends its last known index,
 	// and the leader responds with all entries after that index.
 	SyncWAL(ctx context.Context, in *SyncWALRequest, opts ...grpc.CallOption) (*SyncWALResponse, error)
+	// Join is called by a new node to request entry into the cluster.
+	Join(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (*JoinResponse, error)
+	// Leave is called by a node to request clean exit from the cluster.
+	Leave(ctx context.Context, in *LeaveRequest, opts ...grpc.CallOption) (*LeaveResponse, error)
+	// UpdatePeers is called by the Leader to broadcast membership changes (add/remove peer) to followers.
+	UpdatePeers(ctx context.Context, in *UpdatePeersRequest, opts ...grpc.CallOption) (*UpdatePeersResponse, error)
 }
 
 type replicationClient struct {
@@ -80,6 +89,36 @@ func (c *replicationClient) SyncWAL(ctx context.Context, in *SyncWALRequest, opt
 	return out, nil
 }
 
+func (c *replicationClient) Join(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (*JoinResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JoinResponse)
+	err := c.cc.Invoke(ctx, Replication_Join_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *replicationClient) Leave(ctx context.Context, in *LeaveRequest, opts ...grpc.CallOption) (*LeaveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LeaveResponse)
+	err := c.cc.Invoke(ctx, Replication_Leave_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *replicationClient) UpdatePeers(ctx context.Context, in *UpdatePeersRequest, opts ...grpc.CallOption) (*UpdatePeersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdatePeersResponse)
+	err := c.cc.Invoke(ctx, Replication_UpdatePeers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ReplicationServer is the server API for Replication service.
 // All implementations must embed UnimplementedReplicationServer
 // for forward compatibility.
@@ -96,6 +135,12 @@ type ReplicationServer interface {
 	// it missed while it was down. The follower sends its last known index,
 	// and the leader responds with all entries after that index.
 	SyncWAL(context.Context, *SyncWALRequest) (*SyncWALResponse, error)
+	// Join is called by a new node to request entry into the cluster.
+	Join(context.Context, *JoinRequest) (*JoinResponse, error)
+	// Leave is called by a node to request clean exit from the cluster.
+	Leave(context.Context, *LeaveRequest) (*LeaveResponse, error)
+	// UpdatePeers is called by the Leader to broadcast membership changes (add/remove peer) to followers.
+	UpdatePeers(context.Context, *UpdatePeersRequest) (*UpdatePeersResponse, error)
 	mustEmbedUnimplementedReplicationServer()
 }
 
@@ -114,6 +159,15 @@ func (UnimplementedReplicationServer) RequestVote(context.Context, *RequestVoteR
 }
 func (UnimplementedReplicationServer) SyncWAL(context.Context, *SyncWALRequest) (*SyncWALResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SyncWAL not implemented")
+}
+func (UnimplementedReplicationServer) Join(context.Context, *JoinRequest) (*JoinResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Join not implemented")
+}
+func (UnimplementedReplicationServer) Leave(context.Context, *LeaveRequest) (*LeaveResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Leave not implemented")
+}
+func (UnimplementedReplicationServer) UpdatePeers(context.Context, *UpdatePeersRequest) (*UpdatePeersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdatePeers not implemented")
 }
 func (UnimplementedReplicationServer) mustEmbedUnimplementedReplicationServer() {}
 func (UnimplementedReplicationServer) testEmbeddedByValue()                     {}
@@ -190,6 +244,60 @@ func _Replication_SyncWAL_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Replication_Join_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(JoinRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ReplicationServer).Join(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Replication_Join_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ReplicationServer).Join(ctx, req.(*JoinRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Replication_Leave_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LeaveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ReplicationServer).Leave(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Replication_Leave_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ReplicationServer).Leave(ctx, req.(*LeaveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Replication_UpdatePeers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdatePeersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ReplicationServer).UpdatePeers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Replication_UpdatePeers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ReplicationServer).UpdatePeers(ctx, req.(*UpdatePeersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Replication_ServiceDesc is the grpc.ServiceDesc for Replication service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -208,6 +316,18 @@ var Replication_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SyncWAL",
 			Handler:    _Replication_SyncWAL_Handler,
+		},
+		{
+			MethodName: "Join",
+			Handler:    _Replication_Join_Handler,
+		},
+		{
+			MethodName: "Leave",
+			Handler:    _Replication_Leave_Handler,
+		},
+		{
+			MethodName: "UpdatePeers",
+			Handler:    _Replication_UpdatePeers_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

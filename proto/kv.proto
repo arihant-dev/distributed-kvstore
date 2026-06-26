@@ -19,6 +19,15 @@ service Replication {
   // it missed while it was down. The follower sends its last known index,
   // and the leader responds with all entries after that index.
   rpc SyncWAL(SyncWALRequest) returns (SyncWALResponse);
+
+  // Join is called by a new node to request entry into the cluster.
+  rpc Join(JoinRequest) returns (JoinResponse);
+
+  // Leave is called by a node to request clean exit from the cluster.
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
+
+  // UpdatePeers is called by the Leader to broadcast membership changes (add/remove peer) to followers.
+  rpc UpdatePeers(UpdatePeersRequest) returns (UpdatePeersResponse);
 }
 
 // Represents a single operation matching our store.LogEntry
@@ -62,3 +71,35 @@ message SyncWALResponse {
   repeated LogEntry entries = 1; // All entries after the follower's last_index
   uint64 leader_index = 2;      // The leader's current latest index
 }
+
+message JoinRequest {
+  string node_id = 1;
+  string grpc_address = 2;
+}
+
+message JoinResponse {
+  bool success = 1;
+  string leader_id = 2;
+  string leader_address = 3;
+}
+
+message LeaveRequest {
+  string node_id = 1;
+}
+
+message LeaveResponse {
+  bool success = 1;
+}
+
+message UpdatePeersRequest {
+  string leader_id = 1;
+  uint64 term = 2;
+  string peer_id = 3;
+  string peer_address = 4;
+  bool is_add = 5;
+}
+
+message UpdatePeersResponse {
+  bool success = 1;
+}
+
