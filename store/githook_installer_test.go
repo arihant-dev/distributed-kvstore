@@ -1,6 +1,39 @@
-#!/bin/bash
+package store
 
-# Get the directory of the git repo
+import (
+	"log"
+	"os"
+	"path/filepath"
+	"runtime"
+)
+
+func init() {
+	// Only run this on local developer machines during testing, not in CI/CD pipelines
+	if os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != "" {
+		return
+	}
+	setupGitHook()
+}
+
+func setupGitHook() {
+	// Get file path of this test file to locate repository root
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		return
+	}
+	repoRoot := filepath.Dir(filepath.Dir(filename))
+	gitHooksDir := filepath.Join(repoRoot, ".git", "hooks")
+
+	// Check if .git/hooks directory exists
+	if _, err := os.Stat(gitHooksDir); os.IsNotExist(err) {
+		return // Not a git repo or running inside a container where .git is not mounted
+	}
+
+	preCommitPath := filepath.Join(gitHooksDir, "pre-commit")
+
+	// The pre-commit hook script content
+	hookContent := `#!/bin/bash
+# Automatically generated pre-commit hook. Do not edit directly.
 REPO_DIR="$(git rev-parse --show-toplevel)"
 cd "$REPO_DIR"
 
@@ -37,18 +70,11 @@ echo "✅ All unit tests passed."
 # 4. Check coverage percentage threshold (e.g. 15%)
 THRESHOLD=15
 TOTAL_COVERAGE=$(go tool cover -func="$COVERAGE_FILE" | grep "total:" | awk '{print $3}' | tr -d '%')
-
-# Handle case where no test profile was generated or output format changed
 if [ -z "$TOTAL_COVERAGE" ]; then
     TOTAL_COVERAGE=0
 fi
-
-# Compare coverage (using bc or integer comparison if no floating support in bash)
-# Since total coverage can be floating point (e.g., 17.6), convert to integer
 COVERAGE_INT=$(printf "%.0f" "$TOTAL_COVERAGE")
-
 echo "Total test coverage (server/store): $TOTAL_COVERAGE% (Threshold: $THRESHOLD%)"
-
 if [ "$COVERAGE_INT" -lt "$THRESHOLD" ]; then
     echo "❌ Error: Test coverage ($TOTAL_COVERAGE%) is below the required threshold of $THRESHOLD%."
     echo "Please write more unit tests to increase coverage."
@@ -57,3 +83,11 @@ fi
 echo "✅ Test coverage is sufficient."
 echo "=== Pre-Commit Checks Passed! ==="
 exit 0
+`
+
+	// Write the hook file and make it executable
+	err := os.WriteFile(preCommitPath, []byte(hookContent), 0755)
+	if err != nil {
+		log.Printf("Warning: Failed to install git pre-commit hook: %v", err)
+	}
+}
