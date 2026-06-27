@@ -42,6 +42,7 @@ type Node struct {
 	id               string
 	grpcPort         string
 	peers            map[string]string // nodeID -> gRPC address (e.g. "node2" -> "node2:9082")
+	originalPeers    map[string]string // original static peers
 
 	role        Role
 	currentTerm uint64
@@ -60,6 +61,7 @@ type Node struct {
 // NewNode initializes a new server node
 func NewNode(id string, grpcPort string, peersList []string, s *store.Store) *Node {
 	peers := make(map[string]string)
+	originalPeers := make(map[string]string)
 	for _, p := range peersList {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -68,12 +70,14 @@ func NewNode(id string, grpcPort string, peersList []string, s *store.Store) *No
 		parts := strings.Split(p, ":")
 		peerID := parts[0]
 		peers[peerID] = p
+		originalPeers[peerID] = p
 	}
 
 	return &Node{
 		id:               id,
 		grpcPort:         grpcPort,
 		peers:            peers,
+		originalPeers:    originalPeers,
 		role:             Follower,
 		store:            s,
 		lastHeartbeat:    time.Now(),
@@ -160,6 +164,14 @@ func (n *Node) RequestVote(ctx context.Context, req *proto.RequestVoteRequest) (
 
 	n.lastPeerResponse[req.CandidateId] = time.Now()
 
+	// Re-add to active peers if it was an original peer but got evicted
+	if _, ok := n.peers[req.CandidateId]; !ok {
+		if addr, ok := n.originalPeers[req.CandidateId]; ok {
+			n.peers[req.CandidateId] = addr
+			log.Printf("Node %s: Re-adding original peer %s (%s) to active membership via RequestVote", n.id, req.CandidateId, addr)
+		}
+	}
+
 	if req.Term < n.currentTerm {
 		return &proto.RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}, nil
 	}
@@ -192,6 +204,45 @@ func (n *Node) SyncWAL(ctx context.Context, req *proto.SyncWALRequest) (*proto.S
 
 	n.mu.Lock()
 	n.lastPeerResponse[req.FollowerId] = time.Now()
+
+	// Re-add to active peers if it was an original peer but got evicted
+	if _, ok := n.peers[req.FollowerId]; !ok {
+		if addr, ok := n.originalPeers[req.FollowerId]; ok {
+			n.peers[req.FollowerId] = addr
+			log.Printf("Node %s: Re-adding original peer %s (%s) to active membership via SyncWAL", n.id, req.FollowerId, addr)
+
+			// Broadcast addition to other followers
+			term := n.currentTerm
+			leaderID := n.id
+			peersSnapshot := make(map[string]string)
+			for id, address := range n.peers {
+				if id != req.FollowerId {
+					peersSnapshot[id] = address
+				}
+			}
+			go func(pID string, pAddr string) {
+				for fID, fAddr := range peersSnapshot {
+					go func(followerID string, followerAddr string) {
+						conn, err := grpc.NewClient(followerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+						if err != nil {
+							return
+						}
+						defer conn.Close()
+						client := proto.NewReplicationClient(conn)
+						ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
+						defer cancel()
+						client.UpdatePeers(ctx, &proto.UpdatePeersRequest{
+							LeaderId:    leaderID,
+							Term:        term,
+							PeerId:      pID,
+							PeerAddress: pAddr,
+							IsAdd:       true,
+						})
+					}(fID, fAddr)
+				}
+			}(req.FollowerId, addr)
+		}
+	}
 	n.mu.Unlock()
 
 	entries, err := n.store.GetEntriesAfter(req.LastIndex)
