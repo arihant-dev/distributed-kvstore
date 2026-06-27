@@ -66,12 +66,32 @@ func NewNodeProvisioner(engine *ChaosEngine) *NodeProvisioner {
 		},
 	}
 
-	return &NodeProvisioner{
+	prov := &NodeProvisioner{
 		engine:          engine,
 		targetNodeCount: 3,
 		nextNodeNum:     4,
 		enabled:         false,
 		knownNodes:      nodes,
+	}
+	prov.cleanupDynamicContainers()
+	return prov
+}
+
+func (p *NodeProvisioner) cleanupDynamicContainers() {
+	ctx := context.Background()
+	containers, err := p.engine.DiscoverContainers(ctx)
+	if err != nil {
+		log.Printf("Failed to discover containers for cleanup: %v", err)
+		return
+	}
+
+	for _, c := range containers {
+		if strings.HasPrefix(c.Name, "kvstore-node") {
+			if c.Name != "kvstore-node1" && c.Name != "kvstore-node2" && c.Name != "kvstore-node3" {
+				log.Printf("Cleaning up leftover dynamic container: %s", c.Name)
+				_ = p.engine.docker.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true})
+			}
+		}
 	}
 }
 
@@ -267,13 +287,22 @@ func (p *NodeProvisioner) GetClusterStatus() ClusterStatus {
 // SetEnabled enables or disables auto-provisioning.
 func (p *NodeProvisioner) SetEnabled(enabled bool) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.enabled = enabled
 
 	if enabled {
 		log.Println("Auto-provisioning ENABLED")
+		p.nextNodeNum = 4
+		// Remove any previously dynamic nodes from knownNodes
+		for id := range p.knownNodes {
+			if id != "node1" && id != "node2" && id != "node3" {
+				delete(p.knownNodes, id)
+			}
+		}
+		p.mu.Unlock()
+		p.cleanupDynamicContainers()
 	} else {
 		log.Println("Auto-provisioning DISABLED")
+		p.mu.Unlock()
 	}
 }
 
