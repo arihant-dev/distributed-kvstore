@@ -156,7 +156,7 @@ func (e *ChaosEngine) Kill(ctx context.Context, target string) error {
 	}
 
 	e.state.KilledContainers[name] = true
-	log.Printf("☠️  KILLED container %s (%s)", name, id[:12])
+	log.Printf("KILLED container %s (%s)", name, id[:12])
 	return nil
 }
 
@@ -176,7 +176,7 @@ func (e *ChaosEngine) Pause(ctx context.Context, target string) error {
 	}
 
 	e.state.PausedContainers[name] = true
-	log.Printf("⏸️  PAUSED container %s (%s)", name, id[:12])
+	log.Printf("PAUSED container %s (%s)", name, id[:12])
 	return nil
 }
 
@@ -197,7 +197,7 @@ func (e *ChaosEngine) Resume(ctx context.Context, target string) error {
 			return fmt.Errorf("failed to unpause container %s: %w", name, err)
 		}
 		delete(e.state.PausedContainers, name)
-		log.Printf("▶️  UNPAUSED container %s", name)
+		log.Printf("UNPAUSED container %s", name)
 		return nil
 	}
 
@@ -208,7 +208,7 @@ func (e *ChaosEngine) Resume(ctx context.Context, target string) error {
 	}
 
 	delete(e.state.KilledContainers, name)
-	log.Printf("▶️  RESUMED container %s", name)
+	log.Printf("RESUMED container %s", name)
 	return nil
 }
 
@@ -234,12 +234,12 @@ func (e *ChaosEngine) Slow(ctx context.Context, target string, latencyMs int) er
 		return fmt.Errorf("failed to exec tc in container %s: %w", name, err)
 	}
 	if exitCode != 0 {
-		log.Printf("⚠️  tc command failed in %s (exit %d): %s — container may not have iproute2 installed", name, exitCode, output)
+		log.Printf("tc command failed in %s (exit %d): %s — container may not have iproute2 installed", name, exitCode, output)
 		return fmt.Errorf("tc command failed (exit %d): %s. Ensure iproute2 is installed in the container", exitCode, output)
 	}
 
 	e.state.SlowContainers[name] = latencyMs
-	log.Printf("🐌 SLOWED container %s by %dms", name, latencyMs)
+	log.Printf("SLOWED container %s by %dms", name, latencyMs)
 	return nil
 }
 
@@ -280,7 +280,7 @@ func (e *ChaosEngine) Partition(ctx context.Context, containerA, containerB stri
 	}
 
 	e.state.Partitions[nameB] = append(e.state.Partitions[nameB], sharedNetwork)
-	log.Printf("🔌 PARTITIONED %s ↔ %s (disconnected %s from network %s)", nameA, nameB, nameB, sharedNetwork)
+	log.Printf("PARTITIONED %s <=> %s (disconnected %s from network %s)", nameA, nameB, nameB, sharedNetwork)
 	return nil
 }
 
@@ -333,7 +333,7 @@ func (e *ChaosEngine) Heal(ctx context.Context) error {
 		if err := e.docker.ContainerUnpause(ctx, id); err != nil {
 			errors = append(errors, fmt.Sprintf("unpause %s: %v", name, err))
 		} else {
-			log.Printf("💚 Healed: unpaused %s", name)
+			log.Printf("Healed: unpaused %s", name)
 		}
 	}
 	e.state.PausedContainers = make(map[string]bool)
@@ -346,7 +346,7 @@ func (e *ChaosEngine) Heal(ctx context.Context) error {
 			continue
 		}
 		e.execInContainer(ctx, id, []string{"tc", "qdisc", "del", "dev", "eth0", "root"})
-		log.Printf("💚 Healed: removed latency from %s", name)
+		log.Printf("Healed: removed latency from %s", name)
 	}
 	e.state.SlowContainers = make(map[string]int)
 
@@ -362,7 +362,7 @@ func (e *ChaosEngine) Heal(ctx context.Context) error {
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("reconnect %s to %s: %v", name, netName, err))
 			} else {
-				log.Printf("💚 Healed: reconnected %s to network %s", name, netName)
+				log.Printf("Healed: reconnected %s to network %s", name, netName)
 			}
 		}
 	}
@@ -378,7 +378,7 @@ func (e *ChaosEngine) Heal(ctx context.Context) error {
 		if err := e.docker.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
 			errors = append(errors, fmt.Sprintf("restart %s: %v", name, err))
 		} else {
-			log.Printf("💚 Healed: restarted %s", name)
+			log.Printf("Healed: restarted %s", name)
 		}
 	}
 	e.state.KilledContainers = make(map[string]bool)
@@ -387,7 +387,7 @@ func (e *ChaosEngine) Heal(ctx context.Context) error {
 		return fmt.Errorf("heal completed with errors: %s", strings.Join(errors, "; "))
 	}
 
-	log.Printf("💚 ALL CHAOS HEALED")
+	log.Printf("ALL CHAOS HEALED")
 	return nil
 }
 

@@ -12,11 +12,12 @@ import (
 
 // handler holds a reference to the ChaosEngine and exposes HTTP endpoints.
 type handler struct {
-	engine *ChaosEngine
+	engine      *ChaosEngine
+	provisioner *NodeProvisioner
 }
 
-func newHandler(engine *ChaosEngine) *handler {
-	return &handler{engine: engine}
+func newHandler(engine *ChaosEngine, provisioner *NodeProvisioner) *handler {
+	return &handler{engine: engine, provisioner: provisioner}
 }
 
 // RegisterRoutes sets up all the chaos API routes.
@@ -29,6 +30,8 @@ func (h *handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/chaos/heal", h.withLogging(h.handleHeal))
 	mux.HandleFunc("/chaos/status", h.withLogging(h.handleStatus))
 	mux.HandleFunc("/chaos/containers", h.withLogging(h.handleContainers))
+	mux.HandleFunc("/chaos/cluster", h.withLogging(h.handleClusterStatus))
+	mux.HandleFunc("/chaos/auto-provision", h.withLogging(h.handleAutoProvision))
 }
 
 // --- Request/Response Types ---
