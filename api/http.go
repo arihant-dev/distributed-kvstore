@@ -30,9 +30,25 @@ func (api *APIServer) Start() error {
 	// Endpoints required by the hackathon contract
 	mux.HandleFunc("/store/", api.handleStore)
 	mux.HandleFunc("/health", api.handleHealth)
+	mux.HandleFunc("/leader", api.handleLeader)
 
 	fmt.Printf("HTTP API Server starting on %s\n", api.httpPort)
 	return http.ListenAndServe(api.httpPort, mux)
+}
+
+func (api *APIServer) handleLeader(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"is_leader":           api.node.IsLeader(),
+		"leader_id":           api.node.GetLeaderID(),
+		"leader_http_address": api.node.GetLeaderHTTPAddress(),
+		"leader_grpc_address": api.node.GetLeaderGRPCAddress(),
+	})
 }
 
 func (api *APIServer) handleStore(w http.ResponseWriter, r *http.Request) {
