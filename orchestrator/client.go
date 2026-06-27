@@ -123,3 +123,21 @@ func ChaosHeal(chaosEndpoint string) error {
 	}
 	return nil
 }
+
+// ChaosEnableAutoProvision enables or disables auto-provisioning in the chaos agent.
+func ChaosEnableAutoProvision(chaosEndpoint string, enabled bool) error {
+	body, _ := json.Marshal(map[string]bool{"enabled": enabled})
+	url := fmt.Sprintf("%s/chaos/auto-provision", chaosEndpoint)
+
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("chaos auto-provision failed: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("chaos auto-provision returned status %d", resp.StatusCode)
+	}
+	return nil
+}

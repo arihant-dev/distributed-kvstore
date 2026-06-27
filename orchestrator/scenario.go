@@ -280,6 +280,70 @@ func RunScenario(cfg ScenarioConfig) *Scorecard {
 	scorecard.AddCategory("Load test survival", 5, step6Score, step6Details)
 	fmt.Printf("  → %.1f/5 pts: %s\n", step6Score, step6Details)
 
+	// ─── Step 7: Auto-Provisioning & Dynamic Catch-up (10 pts) ───
+	fmt.Println("\n[Step 7/7] Auto-Provisioning & Dynamic Catch-up...")
+	
+	// 1. Enable Auto-Provisioning on Chaos Agent
+	fmt.Println("  Enabling auto-provisioning on chaos agent...")
+	if err := ChaosEnableAutoProvision(cfg.chaosEndpoint(), true); err != nil {
+		fmt.Printf("  ⚠ Failed to enable auto-provisioning: %v\n", err)
+	}
+
+	// 2. Kill node2 (our target) - again, but this time we leave it dead and let chaos-agent auto-provision node4!
+	fmt.Println("  Killing node2 via chaos agent to trigger auto-provisioning...")
+	if err := ChaosKill(cfg.chaosEndpoint(), "node2"); err != nil {
+		fmt.Printf("  ⚠ Chaos kill failed: %v\n", err)
+	}
+
+	// 3. Wait up to 20 seconds for chaos-agent to detect and provision node4
+	fmt.Println("  Waiting 15 seconds for chaos-agent to detect outage and start replacement (node4)...")
+	time.Sleep(15 * time.Second)
+
+	// 4. Try to read from node4 (http://localhost:8084) to verify it came online, joined the cluster, and synced
+	fmt.Println("  Verifying recovered state and WAL sync on node4 (http://localhost:8084)...")
+	
+	// Write 50 new keys to one of the surviving nodes (node 0 / port 8081)
+	step7Keys := make(map[string]string)
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("s7-repl-%d", i)
+		value := fmt.Sprintf("val-s7-%d-%d", i, rng.Int63())
+		step7Keys[key] = value
+	}
+
+	writeErrors = 0
+	for key, value := range step7Keys {
+		if err := PutKey(cfg.kvEndpoint(0), key, value); err != nil {
+			writeErrors++
+		}
+	}
+
+	// Wait 3 seconds for replication/sync to catch up on node4
+	fmt.Println("  Waiting 3 seconds for replication/sync to catch up on node4...")
+	time.Sleep(3 * time.Second)
+
+	node4Endpoint := "http://localhost:8084"
+	node4Match := 0
+	node4ReadErrors := 0
+	for key, expected := range step7Keys {
+		got, err := GetKey(node4Endpoint, key)
+		if err != nil {
+			node4ReadErrors++
+			continue
+		}
+		if got == expected {
+			node4Match++
+		}
+	}
+
+	step7Score := (float64(node4Match) / 50.0) * 10.0
+	step7Details := fmt.Sprintf("Wrote 50 keys, read %d/50 correctly from auto-provisioned node4 (%d read errors)",
+		node4Match, node4ReadErrors)
+	scorecard.AddCategory("Auto-Provisioning & catchup", 10, step7Score, step7Details)
+	fmt.Printf("  → %.1f/10 pts: %s\n", step7Score, step7Details)
+
+	// Disable auto-provisioning at the end
+	ChaosEnableAutoProvision(cfg.chaosEndpoint(), false)
+
 	// ─── Cleanup: heal any remaining chaos ───
 	fmt.Println("\n[Cleanup] Healing chaos state...")
 	if err := ChaosHeal(cfg.chaosEndpoint()); err != nil {
