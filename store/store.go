@@ -7,13 +7,13 @@ import (
 
 // Store represents our in-memory key-value store, backed by a Write-Ahead Log.
 type Store struct {
-	mu    sync.RWMutex
-	data  map[string][]byte
-	wal   *WAL
-	
+	mu   sync.RWMutex
+	data map[string][]byte
+	wal  *WAL
+
 	// index keeps track of the latest operation number we've processed.
 	// This will be crucial for replication later, so followers know if they are behind.
-	index uint64 
+	index uint64
 }
 
 // NewStore initializes a new Store and recovers any past state from the WAL.
@@ -41,7 +41,7 @@ func NewStore(walPath string) (*Store, error) {
 		} else if entry.Op == OpDelete {
 			delete(store.data, entry.Key)
 		}
-		
+
 		// Update our latest index
 		if entry.Index > store.index {
 			store.index = entry.Index
@@ -57,7 +57,7 @@ func (s *Store) Put(key string, value []byte) error {
 	defer s.mu.Unlock()
 
 	s.index++ // Increment index for the new operation
-	
+
 	// 1. Write to Disk FIRST (The "Ahead" in Write-Ahead Log)
 	entry := LogEntry{
 		Index: s.index,
@@ -65,7 +65,7 @@ func (s *Store) Put(key string, value []byte) error {
 		Key:   key,
 		Value: value,
 	}
-	
+
 	if err := s.wal.Append(entry); err != nil {
 		return fmt.Errorf("failed to write to WAL: %v", err)
 	}
@@ -90,15 +90,15 @@ func (s *Store) Delete(key string) error {
 	defer s.mu.Unlock()
 
 	s.index++
-	
+
 	// 1. Write the delete operation to Disk FIRST
 	entry := LogEntry{
 		Index: s.index,
 		Op:    OpDelete,
 		Key:   key,
-		Value: []byte{}, 
+		Value: []byte{},
 	}
-	
+
 	if err := s.wal.Append(entry); err != nil {
 		return fmt.Errorf("failed to write to WAL: %v", err)
 	}

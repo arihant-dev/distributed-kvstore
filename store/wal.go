@@ -62,14 +62,14 @@ func (w *WAL) Append(entry LogEntry) error {
 	// 2. Encode the metadata (Index, Op, KeyLen) using Little Endian byte order
 	binary.LittleEndian.PutUint64(buf[0:8], entry.Index)
 	buf[8] = byte(entry.Op)
-	
+
 	binary.LittleEndian.PutUint32(buf[9:13], uint32(len(entry.Key)))
-	
+
 	// 3. Copy the actual Key string into the buffer
 	offset := 13
 	copy(buf[offset:], entry.Key)
 	offset += len(entry.Key)
-	
+
 	// 4. Encode the Value Length and Value itself
 	binary.LittleEndian.PutUint32(buf[offset:offset+4], uint32(len(entry.Value)))
 	offset += 4
@@ -92,7 +92,7 @@ func (w *WAL) Replay() ([]LogEntry, error) {
 	}
 
 	var entries []LogEntry
-	
+
 	for {
 		// Read the fixed-size header first: (Index + OpType + KeyLen) = 8 + 1 + 4 = 13 bytes
 		header := make([]byte, 13)

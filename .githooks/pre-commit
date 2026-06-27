@@ -1,0 +1,59 @@
+#!/bin/bash
+
+# Get the directory of the git repo
+REPO_DIR="$(git rev-parse --show-toplevel)"
+cd "$REPO_DIR"
+
+echo "=== Running Pre-Commit Hooks ==="
+
+# 1. Run Go Format check
+echo "Checking code formatting (go fmt)..."
+unformatted=$(go fmt ./...)
+if [ -n "$unformatted" ]; then
+    echo "❌ Error: The following files are not formatted correctly:"
+    echo "$unformatted"
+    echo "Please run 'go fmt ./...' and stage the changes."
+    exit 1
+fi
+echo "✅ Code formatting is clean."
+
+# 2. Run Go Vet (static analysis)
+echo "Running static analysis (go vet)..."
+if ! go vet ./...; then
+    echo "❌ Error: 'go vet' failed. Fix static analysis issues before committing."
+    exit 1
+fi
+echo "✅ Static analysis passed."
+
+# 3. Run Unit Tests & check coverage
+echo "Running unit tests with coverage..."
+COVERAGE_FILE="/tmp/coverage.out"
+if ! go test -coverprofile="$COVERAGE_FILE" ./server ./store; then
+    echo "❌ Error: Some unit tests failed. Commit aborted."
+    exit 1
+fi
+echo "✅ All unit tests passed."
+
+# 4. Check coverage percentage threshold (e.g. 15%)
+THRESHOLD=15
+TOTAL_COVERAGE=$(go tool cover -func="$COVERAGE_FILE" | grep "total:" | awk '{print $3}' | tr -d '%')
+
+# Handle case where no test profile was generated or output format changed
+if [ -z "$TOTAL_COVERAGE" ]; then
+    TOTAL_COVERAGE=0
+fi
+
+# Compare coverage (using bc or integer comparison if no floating support in bash)
+# Since total coverage can be floating point (e.g., 17.6), convert to integer
+COVERAGE_INT=$(printf "%.0f" "$TOTAL_COVERAGE")
+
+echo "Total test coverage (server/store): $TOTAL_COVERAGE% (Threshold: $THRESHOLD%)"
+
+if [ "$COVERAGE_INT" -lt "$THRESHOLD" ]; then
+    echo "❌ Error: Test coverage ($TOTAL_COVERAGE%) is below the required threshold of $THRESHOLD%."
+    echo "Please write more unit tests to increase coverage."
+    exit 1
+fi
+echo "✅ Test coverage is sufficient."
+echo "=== Pre-Commit Checks Passed! ==="
+exit 0

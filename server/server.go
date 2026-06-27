@@ -39,10 +39,10 @@ type Node struct {
 
 	mu sync.RWMutex
 
-	id               string
-	grpcPort         string
-	peers            map[string]string // nodeID -> gRPC address (e.g. "node2" -> "node2:9082")
-	originalPeers    map[string]string // original static peers
+	id            string
+	grpcPort      string
+	peers         map[string]string // nodeID -> gRPC address (e.g. "node2" -> "node2:9082")
+	originalPeers map[string]string // original static peers
 
 	role        Role
 	currentTerm uint64
@@ -708,7 +708,7 @@ func (n *Node) ReplicateEntry(op store.OpType, key string, val []byte) bool {
 		},
 	}
 
-	neededAcks := (len(peersMap)+1)/2
+	neededAcks := (len(peersMap) + 1) / 2
 	if neededAcks == 0 {
 		return true
 	}

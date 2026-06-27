@@ -94,16 +94,16 @@ func (api *APIServer) handleStore(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Invalid JSON", http.StatusBadRequest)
 				return
 			}
-			
+
 			// Apply to our local WAL and memory
 			api.node.GetStore().Put(key, []byte(body["value"]))
-			
+
 			// Trigger replication to followers!
 			if !api.node.ReplicateEntry(store.OpPut, key, []byte(body["value"])) {
 				http.Error(w, "Failed to replicate write to majority of nodes", http.StatusInternalServerError)
 				return
 			}
-			
+
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -125,7 +125,7 @@ func (api *APIServer) handleStore(w http.ResponseWriter, r *http.Request) {
 func (api *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	role := api.node.GetRoleString()
-	
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status": "healthy",
 		"nodes":  len(api.node.GetPeers()) + 1, // Peers + Self
