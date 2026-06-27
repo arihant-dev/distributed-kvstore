@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -21,6 +22,8 @@ const (
 	ElectionTimeoutMin = 500                    // Minimum election timeout in ms
 	ElectionTimeoutMax = 800                    // Maximum election timeout in ms (randomized to avoid split votes)
 	RPCTimeout         = 150 * time.Millisecond // How long to wait for a gRPC response
+	PeerDeadTimeout    = 5 * time.Second        // Peer considered unhealthy after this
+	PeerEvictTimeout   = 15 * time.Second       // Peer evicted from cluster after this
 )
 
 type Role int
@@ -36,22 +39,25 @@ type Node struct {
 
 	mu sync.RWMutex
 
-	id    string
-	peers map[string]string // nodeID -> gRPC address (e.g. "node2" -> "node2:9082")
+	id               string
+	grpcPort         string
+	peers            map[string]string // nodeID -> gRPC address (e.g. "node2" -> "node2:9082")
 
 	role        Role
 	currentTerm uint64
 	votedFor    string
 	leaderId    string
 
-	lastHeartbeat time.Time
+	lastHeartbeat    time.Time
+	lastPeerResponse map[string]time.Time
+	isCatchingUp     bool
 
 	store      *store.Store
 	grpcServer *grpc.Server
 }
 
 // NewNode initializes a new server node
-func NewNode(id string, peersList []string, s *store.Store) *Node {
+func NewNode(id string, grpcPort string, peersList []string, s *store.Store) *Node {
 	peers := make(map[string]string)
 	for _, p := range peersList {
 		p = strings.TrimSpace(p)
@@ -64,11 +70,13 @@ func NewNode(id string, peersList []string, s *store.Store) *Node {
 	}
 
 	return &Node{
-		id:            id,
-		peers:         peers,
-		role:          Follower,
-		store:         s,
-		lastHeartbeat: time.Now(),
+		id:               id,
+		grpcPort:         grpcPort,
+		peers:            peers,
+		role:             Follower,
+		store:            s,
+		lastHeartbeat:    time.Now(),
+		lastPeerResponse: make(map[string]time.Time),
 	}
 }
 
@@ -110,6 +118,7 @@ func (n *Node) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 	// 2. We recognize the leader, reset our election timer
 	n.lastHeartbeat = time.Now()
 	n.leaderId = req.LeaderId
+	n.lastPeerResponse[req.LeaderId] = time.Now()
 
 	// If we were a candidate or had an older term, step down to follower
 	if req.Term > n.currentTerm || n.role == Candidate {
@@ -118,7 +127,15 @@ func (n *Node) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 		n.votedFor = req.LeaderId
 	}
 
-	// 3. Apply replicated entries using ApplyEntry (preserves leader's index)
+	// 3. Check for log gap/inconsistency (lag)
+	myIndex := n.store.GetIndex()
+	if myIndex < req.PrevLogIndex {
+		log.Printf("Node %s: detected lag (local index: %d, leader index: %d). Triggering catchup...", n.id, myIndex, req.PrevLogIndex)
+		go n.catchUpFromLeader(req.LeaderId, myIndex)
+		return &proto.AppendEntriesResponse{Term: n.currentTerm, Success: false}, nil
+	}
+
+	// 4. Apply replicated entries using ApplyEntry (preserves leader's index)
 	for _, pbEntry := range req.Entries {
 		entry := store.LogEntry{
 			Index: pbEntry.Index,
@@ -138,6 +155,8 @@ func (n *Node) AppendEntries(ctx context.Context, req *proto.AppendEntriesReques
 func (n *Node) RequestVote(ctx context.Context, req *proto.RequestVoteRequest) (*proto.RequestVoteResponse, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	n.lastPeerResponse[req.CandidateId] = time.Now()
 
 	if req.Term < n.currentTerm {
 		return &proto.RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}, nil
@@ -168,6 +187,10 @@ func (n *Node) RequestVote(ctx context.Context, req *proto.RequestVoteRequest) (
 func (n *Node) SyncWAL(ctx context.Context, req *proto.SyncWALRequest) (*proto.SyncWALResponse, error) {
 	log.Printf("Node %s: SyncWAL request from %s (their last index: %d, our index: %d)",
 		n.id, req.FollowerId, req.LastIndex, n.store.GetIndex())
+
+	n.mu.Lock()
+	n.lastPeerResponse[req.FollowerId] = time.Now()
+	n.mu.Unlock()
 
 	entries, err := n.store.GetEntriesAfter(req.LastIndex)
 	if err != nil {
@@ -278,12 +301,13 @@ func (n *Node) startElection() {
 		n.leaderId = n.id
 
 		go n.heartbeatTicker()
+		go n.peerHealthMonitor()
 	} else {
 		log.Printf("Node %s LOST election for term %d (%d/%d votes)", n.id, term, votes, totalNodes)
 	}
 }
 
-// heartbeatTicker runs only on the Leader, sending pings every 1 second.
+// heartbeatTicker runs only on the Leader, sending pings every 100ms.
 func (n *Node) heartbeatTicker() {
 	for {
 		n.mu.RLock()
@@ -294,20 +318,22 @@ func (n *Node) heartbeatTicker() {
 
 		term := n.currentTerm
 		leaderID := n.id
-		var peers []string
-		for _, p := range n.peers {
-			peers = append(peers, p)
+		lastIndex := n.store.GetIndex()
+		peersMap := make(map[string]string)
+		for id, addr := range n.peers {
+			peersMap[id] = addr
 		}
 		n.mu.RUnlock()
 
 		req := &proto.AppendEntriesRequest{
-			LeaderId: leaderID,
-			Term:     term,
-			Entries:  nil, // Empty = Heartbeat
+			LeaderId:     leaderID,
+			Term:         term,
+			PrevLogIndex: lastIndex,
+			Entries:      nil, // Empty = Heartbeat
 		}
 
-		for _, peer := range peers {
-			go func(peerAddr string) {
+		for pID, pAddr := range peersMap {
+			go func(peerID string, peerAddr string) {
 				conn, err := grpc.NewClient(peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 				if err != nil {
 					return
@@ -318,8 +344,19 @@ func (n *Node) heartbeatTicker() {
 				ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
 				defer cancel()
 
-				client.AppendEntries(ctx, req)
-			}(peer)
+				res, err := client.AppendEntries(ctx, req)
+				if err == nil {
+					n.mu.Lock()
+					n.lastPeerResponse[peerID] = time.Now()
+					if res.Term > n.currentTerm {
+						log.Printf("Node %s (Leader): Stepping down in heartbeat response because term %d > %d", n.id, res.Term, n.currentTerm)
+						n.currentTerm = res.Term
+						n.role = Follower
+						n.votedFor = ""
+					}
+					n.mu.Unlock()
+				}
+			}(pID, pAddr)
 		}
 
 		time.Sleep(HeartbeatInterval)
@@ -330,11 +367,6 @@ func (n *Node) heartbeatTicker() {
 // This runs once on startup after a crash/restart.
 func (n *Node) attemptRecoverySync() {
 	myIndex := n.store.GetIndex()
-	if myIndex == 0 {
-		log.Printf("Node %s: fresh start (index 0), no recovery needed", n.id)
-		return
-	}
-
 	log.Printf("Node %s: attempting recovery sync (local index: %d)", n.id, myIndex)
 
 	for _, peer := range n.GetPeers() {
@@ -387,16 +419,116 @@ func (n *Node) attemptRecoverySync() {
 	log.Printf("Node %s: could not reach any peer for recovery sync", n.id)
 }
 
+// --- Peer Health Monitor ---
+
+// peerHealthMonitor runs only on the Leader. It checks peer liveness every 2 seconds
+// and evicts peers that haven't responded within PeerEvictTimeout.
+func (n *Node) peerHealthMonitor() {
+	for {
+		time.Sleep(2 * time.Second)
+
+		n.mu.RLock()
+		if n.role != Leader {
+			n.mu.RUnlock()
+			log.Printf("Node %s: peerHealthMonitor exiting (no longer leader)", n.id)
+			return
+		}
+
+		// Snapshot peers and lastPeerResponse under read lock
+		peersSnapshot := make(map[string]string)
+		for id, addr := range n.peers {
+			peersSnapshot[id] = addr
+		}
+		lastResponseSnapshot := make(map[string]time.Time)
+		for id, t := range n.lastPeerResponse {
+			lastResponseSnapshot[id] = t
+		}
+		currentTerm := n.currentTerm
+		leaderID := n.id
+		n.mu.RUnlock()
+
+		var peersToEvict []string
+
+		for peerID := range peersSnapshot {
+			lastResp, exists := lastResponseSnapshot[peerID]
+			if !exists {
+				// No response ever recorded; skip (newly added peer may not have responded yet)
+				continue
+			}
+
+			silence := time.Since(lastResp)
+			if silence > PeerEvictTimeout {
+				log.Printf("Node %s (Leader): Peer %s exceeded evict timeout (%v silent). Removing from cluster.", leaderID, peerID, silence)
+				peersToEvict = append(peersToEvict, peerID)
+			} else if silence > PeerDeadTimeout {
+				log.Printf("Node %s (Leader): Peer %s is unhealthy (%v since last response)", leaderID, peerID, silence)
+			}
+		}
+
+		// Evict dead peers
+		for _, peerID := range peersToEvict {
+			n.mu.Lock()
+			delete(n.peers, peerID)
+			delete(n.lastPeerResponse, peerID)
+			// Snapshot remaining peers for broadcast
+			remainingPeers := make(map[string]string)
+			for id, addr := range n.peers {
+				remainingPeers[id] = addr
+			}
+			n.mu.Unlock()
+
+			log.Printf("Node %s (Leader): Peer %s evicted from membership", leaderID, peerID)
+
+			// Broadcast removal to remaining followers
+			for followerID, followerAddr := range remainingPeers {
+				go func(fID string, fAddr string) {
+					conn, err := grpc.NewClient(fAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+					if err != nil {
+						log.Printf("Node %s (Leader): Failed to connect to %s for eviction broadcast: %v", leaderID, fID, err)
+						return
+					}
+					defer conn.Close()
+
+					client := proto.NewReplicationClient(conn)
+					ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
+					defer cancel()
+
+					_, err = client.UpdatePeers(ctx, &proto.UpdatePeersRequest{
+						LeaderId:    leaderID,
+						Term:        currentTerm,
+						PeerId:      peerID,
+						PeerAddress: "",
+						IsAdd:       false,
+					})
+					if err != nil {
+						log.Printf("Node %s (Leader): Failed to broadcast eviction of %s to %s: %v", leaderID, peerID, fID, err)
+					}
+				}(followerID, followerAddr)
+			}
+		}
+	}
+}
+
 // --- API Helpers ---
 
 func (n *Node) GetStore() *store.Store {
 	return n.store
 }
 
+func (n *Node) GetID() string {
+	return n.id
+}
+
 func (n *Node) IsLeader() bool {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.role == Leader
+}
+
+func (n *Node) GetLeaderID() string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.leaderId
 }
 
 func (n *Node) GetRoleString() string {
@@ -422,6 +554,24 @@ func (n *Node) GetPeers() []string {
 	return addrs
 }
 
+// GetGRPCAddress returns this node's own gRPC address.
+func (n *Node) GetGRPCAddress() string {
+	return n.id + ":" + n.grpcPort
+}
+
+// GetLeaderGRPCAddress returns the gRPC address of the current leader.
+func (n *Node) GetLeaderGRPCAddress() string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.leaderId == "" {
+		return ""
+	}
+	if n.leaderId == n.id {
+		return n.id + ":" + n.grpcPort
+	}
+	return n.peers[n.leaderId]
+}
+
 func (n *Node) AddPeer(peerID, address string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -442,18 +592,29 @@ func (n *Node) GetLeaderHTTPAddress() string {
 	if n.leaderId == "" {
 		return ""
 	}
-
-	// Map node IDs to their HTTP addresses inside Docker
-	switch n.leaderId {
-	case "node1":
-		return "node1:8081"
-	case "node2":
-		return "node2:8082"
-	case "node3":
-		return "node3:8083"
-	default:
-		return n.leaderId + ":8080"
+	if n.leaderId == n.id {
+		var grpcPortInt int
+		_, err := fmt.Sscanf(n.grpcPort, "%d", &grpcPortInt)
+		if err == nil {
+			return fmt.Sprintf("%s:%d", n.id, grpcPortInt-1000)
+		}
+		return n.id + ":8080"
 	}
+
+	addr, ok := n.peers[n.leaderId]
+	if !ok {
+		return ""
+	}
+
+	parts := strings.Split(addr, ":")
+	if len(parts) == 2 {
+		var port int
+		_, err := fmt.Sscanf(parts[1], "%d", &port)
+		if err == nil {
+			return fmt.Sprintf("%s:%d", parts[0], port-1000)
+		}
+	}
+	return addr
 }
 
 // ReplicateEntry sends a single new entry to all followers and waits for a majority to acknowledge.
@@ -466,16 +627,17 @@ func (n *Node) ReplicateEntry(op store.OpType, key string, val []byte) bool {
 	}
 	term := n.currentTerm
 	leaderID := n.id
-	var peers []string
-	for _, p := range n.peers {
-		peers = append(peers, p)
+	peersMap := make(map[string]string)
+	for id, addr := range n.peers {
+		peersMap[id] = addr
 	}
 	index := n.store.GetIndex()
 	n.mu.RUnlock()
 
 	req := &proto.AppendEntriesRequest{
-		LeaderId: leaderID,
-		Term:     term,
+		LeaderId:     leaderID,
+		Term:         term,
+		PrevLogIndex: index - 1,
 		Entries: []*proto.LogEntry{
 			{
 				Index: index,
@@ -486,17 +648,17 @@ func (n *Node) ReplicateEntry(op store.OpType, key string, val []byte) bool {
 		},
 	}
 
-	neededAcks := (len(peers)+1)/2
+	neededAcks := (len(peersMap)+1)/2
 	if neededAcks == 0 {
 		return true
 	}
 
-	ackChan := make(chan bool, len(peers))
+	ackChan := make(chan bool, len(peersMap))
 	var wg sync.WaitGroup
 
-	for _, peer := range peers {
+	for pID, pAddr := range peersMap {
 		wg.Add(1)
-		go func(peerAddr string) {
+		go func(peerID string, peerAddr string) {
 			defer wg.Done()
 
 			conn, err := grpc.NewClient(peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -512,11 +674,24 @@ func (n *Node) ReplicateEntry(op store.OpType, key string, val []byte) bool {
 
 			res, err := client.AppendEntries(ctx, req)
 			if err == nil && res.Success {
+				n.mu.Lock()
+				n.lastPeerResponse[peerID] = time.Now()
+				n.mu.Unlock()
 				ackChan <- true
 			} else {
+				if err == nil {
+					n.mu.Lock()
+					if res.Term > n.currentTerm {
+						log.Printf("Node %s (Leader): Stepping down in replication response because term %d > %d", n.id, res.Term, n.currentTerm)
+						n.currentTerm = res.Term
+						n.role = Follower
+						n.votedFor = ""
+					}
+					n.mu.Unlock()
+				}
 				ackChan <- false
 			}
-		}(peer)
+		}(pID, pAddr)
 	}
 
 	go func() {
@@ -534,11 +709,268 @@ func (n *Node) ReplicateEntry(op store.OpType, key string, val []byte) bool {
 			}
 		} else {
 			failures++
-			if len(peers)-failures < neededAcks {
+			if len(peersMap)-failures < neededAcks {
 				return false
 			}
 		}
 	}
 
 	return acks >= neededAcks
+}
+
+func (n *Node) catchUpFromLeader(leaderID string, startIndex uint64) {
+	n.mu.Lock()
+	if n.isCatchingUp {
+		n.mu.Unlock()
+		return
+	}
+	n.isCatchingUp = true
+	n.mu.Unlock()
+
+	defer func() {
+		n.mu.Lock()
+		n.isCatchingUp = false
+		n.mu.Unlock()
+	}()
+
+	n.mu.RLock()
+	leaderAddr, ok := n.peers[leaderID]
+	n.mu.RUnlock()
+
+	if !ok {
+		log.Printf("Node %s: catchUp: leader %s address unknown, trying general recovery sync", n.id, leaderID)
+		n.attemptRecoverySync()
+		return
+	}
+
+	log.Printf("Node %s: catchUp: contacting leader %s at %s starting from index %d", n.id, leaderID, leaderAddr, startIndex)
+
+	conn, err := grpc.NewClient(leaderAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Printf("Node %s: catchUp: failed to connect to leader: %v", n.id, err)
+		return
+	}
+	defer conn.Close()
+
+	client := proto.NewReplicationClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res, err := client.SyncWAL(ctx, &proto.SyncWALRequest{
+		FollowerId: n.id,
+		LastIndex:  startIndex,
+	})
+	if err != nil {
+		log.Printf("Node %s: catchUp: SyncWAL from leader failed: %v", n.id, err)
+		return
+	}
+
+	if len(res.Entries) == 0 {
+		log.Printf("Node %s: catchUp: already up to date with leader", n.id)
+		return
+	}
+
+	applied := 0
+	for _, pbEntry := range res.Entries {
+		entry := store.LogEntry{
+			Index: pbEntry.Index,
+			Op:    store.OpType(pbEntry.Op),
+			Key:   pbEntry.Key,
+			Value: pbEntry.Value,
+		}
+		if err := n.store.ApplyEntry(entry); err != nil {
+			log.Printf("Node %s: catchUp: failed to apply entry %d: %v", n.id, entry.Index, err)
+		} else {
+			applied++
+		}
+	}
+
+	log.Printf("Node %s: catchUp complete! Applied %d entries from leader %s (new index: %d)",
+		n.id, applied, leaderID, n.store.GetIndex())
+}
+
+// Join is called by a new node to request entry into the cluster.
+func (n *Node) Join(ctx context.Context, req *proto.JoinRequest) (*proto.JoinResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.role != Leader {
+		leaderAddr := ""
+		if n.leaderId != "" && n.leaderId != n.id {
+			leaderAddr = n.peers[n.leaderId]
+		}
+		return &proto.JoinResponse{
+			Success:       false,
+			LeaderId:      n.leaderId,
+			LeaderAddress: leaderAddr,
+		}, nil
+	}
+
+	// We are the leader!
+	n.peers[req.NodeId] = req.GrpcAddress
+	log.Printf("Node %s (Leader): Peer %s (%s) joined cluster", n.id, req.NodeId, req.GrpcAddress)
+
+	// Broadcast the membership change to other followers
+	for peerID, peerAddr := range n.peers {
+		if peerID == req.NodeId {
+			continue
+		}
+		go func(pID string, pAddr string) {
+			conn, err := grpc.NewClient(pAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				log.Printf("Node %s (Leader): Failed to connect to follower %s for UpdatePeers: %v", n.id, pID, err)
+				return
+			}
+			defer conn.Close()
+
+			client := proto.NewReplicationClient(conn)
+			ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
+			defer cancel()
+
+			_, err = client.UpdatePeers(ctx, &proto.UpdatePeersRequest{
+				LeaderId:    n.id,
+				Term:        n.currentTerm,
+				PeerId:      req.NodeId,
+				PeerAddress: req.GrpcAddress,
+				IsAdd:       true,
+			})
+			if err != nil {
+				log.Printf("Node %s (Leader): Failed to UpdatePeers on follower %s: %v", n.id, pID, err)
+			}
+		}(peerID, peerAddr)
+	}
+
+	// Trigger async full WAL sync to the new node so it catches up immediately
+	newNodeAddr := req.GrpcAddress
+	newNodeID := req.NodeId
+	go func() {
+		entries, err := n.store.GetEntriesAfter(0)
+		if err != nil {
+			log.Printf("Node %s (Leader): Failed to get WAL entries for sync to %s: %v", n.id, newNodeID, err)
+			return
+		}
+		if len(entries) == 0 {
+			log.Printf("Node %s (Leader): No WAL entries to sync to %s", n.id, newNodeID)
+			return
+		}
+
+		// Convert store.LogEntry -> proto.LogEntry
+		var pbEntries []*proto.LogEntry
+		for _, e := range entries {
+			pbEntries = append(pbEntries, &proto.LogEntry{
+				Index: e.Index,
+				Op:    uint32(e.Op),
+				Key:   e.Key,
+				Value: e.Value,
+			})
+		}
+
+		conn, err := grpc.NewClient(newNodeAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			log.Printf("Node %s (Leader): Failed to connect to new node %s (%s) for WAL sync: %v", n.id, newNodeID, newNodeAddr, err)
+			return
+		}
+		defer conn.Close()
+
+		n.mu.RLock()
+		term := n.currentTerm
+		leaderID := n.id
+		n.mu.RUnlock()
+
+		client := proto.NewReplicationClient(conn)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		res, err := client.AppendEntries(ctx, &proto.AppendEntriesRequest{
+			LeaderId:     leaderID,
+			Term:         term,
+			PrevLogIndex: 0,
+			Entries:      pbEntries,
+		})
+		if err != nil {
+			log.Printf("Node %s (Leader): WAL sync to new node %s failed: %v", n.id, newNodeID, err)
+		} else {
+			log.Printf("Node %s (Leader): WAL sync to new node %s succeeded (sent %d entries, response term: %d, success: %v)",
+				n.id, newNodeID, len(pbEntries), res.Term, res.Success)
+		}
+	}()
+
+	return &proto.JoinResponse{
+		Success: true,
+	}, nil
+}
+
+// Leave is called by a node to request clean exit from the cluster.
+func (n *Node) Leave(ctx context.Context, req *proto.LeaveRequest) (*proto.LeaveResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.role != Leader {
+		return &proto.LeaveResponse{
+			Success: false,
+		}, nil
+	}
+
+	// We are the leader!
+	delete(n.peers, req.NodeId)
+	log.Printf("Node %s (Leader): Peer %s left cluster", n.id, req.NodeId)
+
+	// Broadcast the membership change to other followers
+	for peerID, peerAddr := range n.peers {
+		go func(pID string, pAddr string) {
+			conn, err := grpc.NewClient(pAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				log.Printf("Node %s (Leader): Failed to connect to follower %s for UpdatePeers: %v", n.id, pID, err)
+				return
+			}
+			defer conn.Close()
+
+			client := proto.NewReplicationClient(conn)
+			ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
+			defer cancel()
+
+			_, err = client.UpdatePeers(ctx, &proto.UpdatePeersRequest{
+				LeaderId:    n.id,
+				Term:        n.currentTerm,
+				PeerId:      req.NodeId,
+				PeerAddress: "",
+				IsAdd:       false,
+			})
+			if err != nil {
+				log.Printf("Node %s (Leader): Failed to UpdatePeers on follower %s: %v", n.id, pID, err)
+			}
+		}(peerID, peerAddr)
+	}
+
+	return &proto.LeaveResponse{
+		Success: true,
+	}, nil
+}
+
+// UpdatePeers is called by the Leader to broadcast membership changes (add/remove peer) to followers.
+func (n *Node) UpdatePeers(ctx context.Context, req *proto.UpdatePeersRequest) (*proto.UpdatePeersResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if req.Term < n.currentTerm {
+		return &proto.UpdatePeersResponse{Success: false}, nil
+	}
+
+	if req.Term > n.currentTerm {
+		n.currentTerm = req.Term
+		n.role = Follower
+		n.votedFor = req.LeaderId
+	}
+	n.leaderId = req.LeaderId
+	n.lastHeartbeat = time.Now()
+
+	if req.IsAdd {
+		n.peers[req.PeerId] = req.PeerAddress
+		log.Printf("Node %s (Follower): Peer %s (%s) added to membership via leader %s", n.id, req.PeerId, req.PeerAddress, req.LeaderId)
+	} else {
+		delete(n.peers, req.PeerId)
+		log.Printf("Node %s (Follower): Peer %s removed from membership via leader %s", n.id, req.PeerId, req.LeaderId)
+	}
+
+	return &proto.UpdatePeersResponse{Success: true}, nil
 }
