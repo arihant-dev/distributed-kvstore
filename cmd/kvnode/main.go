@@ -81,7 +81,7 @@ func main() {
 	// 4. If Peers is empty, but Seed Nodes are specified, start dynamic join process
 	if len(peers) == 0 && seedNodesStr != "" {
 		seeds := strings.Split(seedNodesStr, ",")
-		go joinCluster(id, node.GetGRPCAddress(), seeds)
+		go joinCluster(id, node, seeds)
 	}
 
 	// 5. Start the HTTP API Server (blocking)
@@ -91,7 +91,7 @@ func main() {
 	}
 }
 
-func joinCluster(nodeID string, myGRPCAddr string, seeds []string) {
+func joinCluster(nodeID string, n *server.Node, seeds []string) {
 	// Give the server a moment to start up and allow local ports to bind
 	time.Sleep(3 * time.Second)
 
@@ -141,10 +141,12 @@ func joinCluster(nodeID string, myGRPCAddr string, seeds []string) {
 		log.Printf("Node %s: No active leader found among seeds. Retrying in 5 seconds...", nodeID)
 		go func() {
 			time.Sleep(5 * time.Second)
-			joinCluster(nodeID, myGRPCAddr, seeds)
+			joinCluster(nodeID, n, seeds)
 		}()
 		return
 	}
+
+	myGRPCAddr := n.GetGRPCAddress()
 
 	// Send gRPC Join call to the leader
 	conn, err := grpc.NewClient(leaderGRPCAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -152,7 +154,7 @@ func joinCluster(nodeID string, myGRPCAddr string, seeds []string) {
 		log.Printf("Node %s: Failed to connect to leader %s: %v. Retrying in 5 seconds...", nodeID, leaderGRPCAddr, err)
 		go func() {
 			time.Sleep(5 * time.Second)
-			joinCluster(nodeID, myGRPCAddr, seeds)
+			joinCluster(nodeID, n, seeds)
 		}()
 		return
 	}
@@ -170,7 +172,7 @@ func joinCluster(nodeID string, myGRPCAddr string, seeds []string) {
 		log.Printf("Node %s: gRPC Join call to leader failed: %v. Retrying in 5 seconds...", nodeID, err)
 		go func() {
 			time.Sleep(5 * time.Second)
-			joinCluster(nodeID, myGRPCAddr, seeds)
+			joinCluster(nodeID, n, seeds)
 		}()
 		return
 	}
@@ -180,10 +182,11 @@ func joinCluster(nodeID string, myGRPCAddr string, seeds []string) {
 			nodeID, res.LeaderId, res.LeaderAddress)
 		go func() {
 			time.Sleep(5 * time.Second)
-			joinCluster(nodeID, myGRPCAddr, seeds)
+			joinCluster(nodeID, n, seeds)
 		}()
 		return
 	}
 
 	log.Printf("Node %s: Successfully joined the cluster!", nodeID)
+	n.EnableElection()
 }

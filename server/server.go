@@ -51,6 +51,7 @@ type Node struct {
 	lastHeartbeat    time.Time
 	lastPeerResponse map[string]time.Time
 	isCatchingUp     bool
+	preventElection  bool
 
 	store      *store.Store
 	grpcServer *grpc.Server
@@ -77,6 +78,7 @@ func NewNode(id string, grpcPort string, peersList []string, s *store.Store) *No
 		store:            s,
 		lastHeartbeat:    time.Now(),
 		lastPeerResponse: make(map[string]time.Time),
+		preventElection:  len(peers) == 0,
 	}
 }
 
@@ -227,9 +229,10 @@ func (n *Node) electionTicker() {
 		n.mu.RLock()
 		role := n.role
 		timeSinceHeartbeat := time.Since(n.lastHeartbeat)
+		prevent := n.preventElection
 		n.mu.RUnlock()
 
-		if role != Leader && timeSinceHeartbeat > timeout {
+		if role != Leader && !prevent && timeSinceHeartbeat > timeout {
 			log.Printf("Node %s: election timeout reached (%v)! Starting election...", n.id, timeout)
 			n.startElection()
 		}
@@ -300,23 +303,22 @@ func (n *Node) startElection() {
 		n.role = Leader
 		n.leaderId = n.id
 
-		go n.heartbeatTicker()
-		go n.peerHealthMonitor()
+		go n.heartbeatTicker(n.currentTerm)
+		go n.peerHealthMonitor(n.currentTerm)
 	} else {
 		log.Printf("Node %s LOST election for term %d (%d/%d votes)", n.id, term, votes, totalNodes)
 	}
 }
 
 // heartbeatTicker runs only on the Leader, sending pings every 100ms.
-func (n *Node) heartbeatTicker() {
+func (n *Node) heartbeatTicker(term uint64) {
 	for {
 		n.mu.RLock()
-		if n.role != Leader {
+		if n.role != Leader || n.currentTerm != term {
 			n.mu.RUnlock()
 			return
 		}
 
-		term := n.currentTerm
 		leaderID := n.id
 		lastIndex := n.store.GetIndex()
 		peersMap := make(map[string]string)
@@ -423,14 +425,14 @@ func (n *Node) attemptRecoverySync() {
 
 // peerHealthMonitor runs only on the Leader. It checks peer liveness every 2 seconds
 // and evicts peers that haven't responded within PeerEvictTimeout.
-func (n *Node) peerHealthMonitor() {
+func (n *Node) peerHealthMonitor(term uint64) {
 	for {
 		time.Sleep(2 * time.Second)
 
 		n.mu.RLock()
-		if n.role != Leader {
+		if n.role != Leader || n.currentTerm != term {
 			n.mu.RUnlock()
-			log.Printf("Node %s: peerHealthMonitor exiting (no longer leader)", n.id)
+			log.Printf("Node %s: peerHealthMonitor exiting (no longer leader or term changed from %d)", n.id, term)
 			return
 		}
 
@@ -570,6 +572,13 @@ func (n *Node) GetLeaderGRPCAddress() string {
 		return n.id + ":" + n.grpcPort
 	}
 	return n.peers[n.leaderId]
+}
+
+func (n *Node) EnableElection() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.preventElection = false
+	log.Printf("Node %s: election enabled", n.id)
 }
 
 func (n *Node) AddPeer(peerID, address string) {
