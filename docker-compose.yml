@@ -42,7 +42,7 @@ services:
 
   # MANDATORY — the chaos agent (organizer toolkit)
   chaos-agent:
-    build: ./chaos-agent
+    image: ghcr.io/arihant-dev/chaos-agent:latest
     container_name: chaos-agent
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
