@@ -12,3 +12,5 @@ The Chaos Agent is a Docker API controller designed to inject faults, disconnect
 *   `POST /chaos/heal`: Restores all containers and network interfaces to their healthy state.
 *   `GET /chaos/status`: Returns current status of all chaos operations and active network partitions.
 *   `GET /chaos/containers`: Returns a list of discovered containers and their current states.
+*   `GET /chaos/cluster`: Returns the active nodes list, their ports, and their health status.
+*   `POST /chaos/auto-provision {"enabled": true|false}`: Enables or disables the auto-provisioning monitor loop.

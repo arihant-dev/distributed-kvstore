@@ -31,5 +31,10 @@ Keep everything in a single repository but separate directories:
 *   `template/`: Distributed KV store source code.
 *   `grader/`: Chaos agent, traffic simulator, and scoring orchestrator.
 
-## Dynamic Node Creation (Pending)
-*   **TODO**: Implement background monitoring inside the chaos-agent or orchestrator to detect if the cluster node count falls below 3 and automatically provision/start a replacement container.
+## Dynamic Node Auto-Provisioning & Discovery
+
+The system supports automatic replacement of failed nodes:
+1. **Detection**: The chaos-agent monitors cluster health via `GET /health` endpoints.
+2. **Provisioning**: If auto-provisioning is enabled and healthy node count falls below 3, the chaos-agent inspects surviving containers to discover the network name and image, then starts a new container (e.g. `node4`) passing the survivors' addresses in `SEED_NODES`.
+3. **Leader Discovery & Join**: The new node boots up, queries `/leader` on the seed nodes, and sends a gRPC `Join` call to the active leader.
+4. **State Catch-up**: The leader adds the new node to the cluster membership, broadcasts the updated peers list to surviving followers, and executes a full WAL state transfer to the new node to sync all historical records.
