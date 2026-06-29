@@ -62,7 +62,6 @@ func (api *APIServer) handleStore(w http.ResponseWriter, r *http.Request) {
 
 	// GET is always served locally (Eventual Consistency / AP)
 	// We read directly from our local memory map, even if we are a follower.
-	// This means reads are blazing fast, but might be slightly stale if we just got partitioned.
 	if r.Method == http.MethodGet {
 		val, exists := api.node.GetStore().Get(key)
 		if !exists {
@@ -96,12 +95,8 @@ func (api *APIServer) handleStore(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// P0 Fix #1/#2: Reserve the log index WITHOUT writing to WAL yet.
-			// ReplicateEntry commits locally only after quorum acks.
-			entry := api.node.GetStore().PrepareEntry(store.OpPut, key, []byte(body["value"]))
-
-			if !api.node.ReplicateEntry(entry) {
-				// ReplicateEntry rolls back the index reservation on failure.
+			// P1 Update: Prepare, replicate, and commit are handled atomically in ReplicateEntry
+			if !api.node.ReplicateEntry(store.OpPut, key, []byte(body["value"])) {
 				http.Error(w, "Failed to replicate write to majority of nodes", http.StatusInternalServerError)
 				return
 			}
@@ -111,16 +106,14 @@ func (api *APIServer) handleStore(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if r.Method == http.MethodDelete {
-			// P0 Fix #4: Return 404 if the key doesn't exist (matches API contract).
+			// Return 404 if the key doesn't exist (matches API contract)
 			if _, exists := api.node.GetStore().Get(key); !exists {
 				http.Error(w, "Not Found", http.StatusNotFound)
 				return
 			}
 
-			// Reserve log index, replicate to quorum, then commit locally.
-			entry := api.node.GetStore().PrepareEntry(store.OpDelete, key, nil)
-
-			if !api.node.ReplicateEntry(entry) {
+			// P1 Update: Prepare, replicate, and commit are handled atomically in ReplicateEntry
+			if !api.node.ReplicateEntry(store.OpDelete, key, nil) {
 				http.Error(w, "Failed to replicate delete to majority of nodes", http.StatusInternalServerError)
 				return
 			}
@@ -145,7 +138,6 @@ func (api *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // proxyRequest forwards an HTTP request to the Leader.
-// P0 Fix #14: uses a 5s timeout so partitioned leaders don't hang goroutines.
 func (api *APIServer) proxyRequest(w http.ResponseWriter, r *http.Request, leaderAddr string) {
 	url := fmt.Sprintf("http://%s%s", leaderAddr, r.URL.Path)
 
@@ -158,7 +150,7 @@ func (api *APIServer) proxyRequest(w http.ResponseWriter, r *http.Request, leade
 
 	proxyReq.Header = r.Header
 
-	// P0 Fix #14: was &http.Client{} with no timeout — hangs forever when leader is partitioned.
+	// Proxy client with 5s timeout to prevent goroutine leaks under partition chaos
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(proxyReq)
 	if err != nil {

@@ -56,6 +56,16 @@ type Node struct {
 
 	store      *store.Store
 	grpcServer *grpc.Server
+
+	// P1 Fix #9: Persistent gRPC connection pool. Creating a new TCP+HTTP/2 connection
+	// per RPC call (20+ per second for heartbeats alone) causes FD exhaustion under load.
+	// Connections are created lazily, reused, and evicted only on error.
+	connMu   sync.Mutex
+	connPool map[string]*grpc.ClientConn
+
+	// writeMu serializes concurrent writes so PrepareEntry+ApplyEntry are always
+	// called in index order on the leader, preventing index gaps from concurrent failures.
+	writeMu sync.Mutex
 }
 
 // NewNode initializes a new server node
@@ -83,6 +93,37 @@ func NewNode(id string, grpcPort string, peersList []string, s *store.Store) *No
 		lastHeartbeat:    time.Now(),
 		lastPeerResponse: make(map[string]time.Time),
 		preventElection:  len(peers) == 0,
+		connPool:         make(map[string]*grpc.ClientConn),
+	}
+}
+
+// dialPeer returns a cached gRPC client connection for the given address.
+// If no connection exists in the pool, it establishes one.
+func (n *Node) dialPeer(addr string) (*grpc.ClientConn, error) {
+	n.connMu.Lock()
+	defer n.connMu.Unlock()
+
+	if conn, ok := n.connPool[addr]; ok {
+		return conn, nil
+	}
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+
+	n.connPool[addr] = conn
+	return conn, nil
+}
+
+// resetConn closes and removes a peer's connection from the pool on error.
+func (n *Node) resetConn(addr string) {
+	n.connMu.Lock()
+	defer n.connMu.Unlock()
+
+	if conn, ok := n.connPool[addr]; ok {
+		_ = conn.Close()
+		delete(n.connPool, addr)
 	}
 }
 
@@ -223,21 +264,23 @@ func (n *Node) SyncWAL(ctx context.Context, req *proto.SyncWALRequest) (*proto.S
 			go func(pID string, pAddr string) {
 				for fID, fAddr := range peersSnapshot {
 					go func(followerID string, followerAddr string) {
-						conn, err := grpc.NewClient(followerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+						conn, err := n.dialPeer(followerAddr)
 						if err != nil {
 							return
 						}
-						defer conn.Close()
 						client := proto.NewReplicationClient(conn)
 						ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
 						defer cancel()
-						client.UpdatePeers(ctx, &proto.UpdatePeersRequest{
+						_, err = client.UpdatePeers(ctx, &proto.UpdatePeersRequest{
 							LeaderId:    leaderID,
 							Term:        term,
 							PeerId:      pID,
 							PeerAddress: pAddr,
 							IsAdd:       true,
 						})
+						if err != nil {
+							n.resetConn(followerAddr)
+						}
 					}(fID, fAddr)
 				}
 			}(req.FollowerId, addr)
@@ -322,11 +365,10 @@ func (n *Node) startElection() {
 		go func(peerAddr string) {
 			defer wg.Done()
 
-			conn, err := grpc.NewClient(peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err := n.dialPeer(peerAddr)
 			if err != nil {
 				return
 			}
-			defer conn.Close()
 
 			client := proto.NewReplicationClient(conn)
 			ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
@@ -337,6 +379,8 @@ func (n *Node) startElection() {
 				voteMu.Lock()
 				votes++
 				voteMu.Unlock()
+			} else if err != nil {
+				n.resetConn(peerAddr)
 			}
 		}(peer)
 	}
@@ -387,11 +431,10 @@ func (n *Node) heartbeatTicker(term uint64) {
 
 		for pID, pAddr := range peersMap {
 			go func(peerID string, peerAddr string) {
-				conn, err := grpc.NewClient(peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+				conn, err := n.dialPeer(peerAddr)
 				if err != nil {
 					return
 				}
-				defer conn.Close()
 
 				client := proto.NewReplicationClient(conn)
 				ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
@@ -408,6 +451,8 @@ func (n *Node) heartbeatTicker(term uint64) {
 						n.votedFor = ""
 					}
 					n.mu.Unlock()
+				} else {
+					n.resetConn(peerAddr)
 				}
 			}(pID, pAddr)
 		}
@@ -423,7 +468,7 @@ func (n *Node) attemptRecoverySync() {
 	log.Printf("Node %s: attempting recovery sync (local index: %d)", n.id, myIndex)
 
 	for _, peer := range n.GetPeers() {
-		conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := n.dialPeer(peer)
 		if err != nil {
 			continue
 		}
@@ -436,10 +481,10 @@ func (n *Node) attemptRecoverySync() {
 			LastIndex:  myIndex,
 		})
 		cancel()
-		conn.Close()
 
 		if err != nil {
 			log.Printf("Node %s: SyncWAL from %s failed: %v", n.id, peer, err)
+			n.resetConn(peer)
 			continue
 		}
 
@@ -535,12 +580,11 @@ func (n *Node) peerHealthMonitor(term uint64) {
 			// Broadcast removal to remaining followers
 			for followerID, followerAddr := range remainingPeers {
 				go func(fID string, fAddr string) {
-					conn, err := grpc.NewClient(fAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+					conn, err := n.dialPeer(fAddr)
 					if err != nil {
 						log.Printf("Node %s (Leader): Failed to connect to %s for eviction broadcast: %v", leaderID, fID, err)
 						return
 					}
-					defer conn.Close()
 
 					client := proto.NewReplicationClient(conn)
 					ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
@@ -555,6 +599,7 @@ func (n *Node) peerHealthMonitor(term uint64) {
 					})
 					if err != nil {
 						log.Printf("Node %s (Leader): Failed to broadcast eviction of %s to %s: %v", leaderID, peerID, fID, err)
+						n.resetConn(fAddr)
 					}
 				}(followerID, followerAddr)
 			}
@@ -677,18 +722,17 @@ func (n *Node) GetLeaderHTTPAddress() string {
 	return addr
 }
 
-// ReplicateEntry replicates a pre-prepared LogEntry to followers and, on quorum,
-// commits it locally. The entry must have been obtained from store.PrepareEntry,
-// which reserves the index without writing to WAL. If replication fails, the
-// index reservation is rolled back so no phantom entries are left behind.
-//
-// This is the fix for the write-then-replicate atomicity bug: the leader now
-// commits locally ONLY after a majority of followers have acked the entry.
-func (n *Node) ReplicateEntry(entry store.LogEntry) bool {
+// ReplicateEntry creates, replicates, and commits a new LogEntry to the cluster.
+// It serializes concurrent writes using writeMu, prepares the log entry with a
+// unique index (advancing nextIndex), broadcasts it to peers using persistent
+// gRPC connections, and applies it to the local store upon quorum acknowledgment.
+func (n *Node) ReplicateEntry(op store.OpType, key string, val []byte) bool {
+	n.writeMu.Lock()
+	defer n.writeMu.Unlock()
+
 	n.mu.RLock()
 	if n.role != Leader {
 		n.mu.RUnlock()
-		n.store.RollbackIndex()
 		return false
 	}
 	term := n.currentTerm
@@ -698,6 +742,9 @@ func (n *Node) ReplicateEntry(entry store.LogEntry) bool {
 		peersMap[id] = addr
 	}
 	n.mu.RUnlock()
+
+	// Prepare entry under writeMu to ensure correct sequence ordering
+	entry := n.store.PrepareEntry(op, key, val)
 
 	req := &proto.AppendEntriesRequest{
 		LeaderId:     leaderID,
@@ -714,11 +761,9 @@ func (n *Node) ReplicateEntry(entry store.LogEntry) bool {
 	}
 
 	neededAcks := (len(peersMap) + 1) / 2
-	// Single-node cluster: commit locally and return immediately.
 	if neededAcks == 0 {
 		if err := n.store.ApplyEntry(entry); err != nil {
 			log.Printf("Node %s: failed to apply entry locally (single-node): %v", n.id, err)
-			n.store.RollbackIndex()
 			return false
 		}
 		return true
@@ -732,12 +777,11 @@ func (n *Node) ReplicateEntry(entry store.LogEntry) bool {
 		go func(peerID string, peerAddr string) {
 			defer wg.Done()
 
-			conn, err := grpc.NewClient(peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err := n.dialPeer(peerAddr)
 			if err != nil {
 				ackChan <- false
 				return
 			}
-			defer conn.Close()
 
 			client := proto.NewReplicationClient(conn)
 			ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
@@ -759,6 +803,8 @@ func (n *Node) ReplicateEntry(entry store.LogEntry) bool {
 						n.votedFor = ""
 					}
 					n.mu.Unlock()
+				} else {
+					n.resetConn(peerAddr)
 				}
 				ackChan <- false
 			}
@@ -789,17 +835,11 @@ func (n *Node) ReplicateEntry(entry store.LogEntry) bool {
 	}
 
 	if !quorumReached {
-		// Roll back the reserved index — the entry was never committed to anyone.
-		n.store.RollbackIndex()
 		return false
 	}
 
-	// Quorum reached: now commit on the leader itself.
 	if err := n.store.ApplyEntry(entry); err != nil {
 		log.Printf("Node %s (Leader): CRITICAL — failed to apply entry locally after quorum: %v", n.id, err)
-		// The followers have it but we couldn't commit locally. This is very rare
-		// (disk full / I/O error). Return true anyway — the write IS durable on the
-		// majority, and our own WAL replay will pick it up when we restart.
 		return true
 	}
 
@@ -833,12 +873,11 @@ func (n *Node) catchUpFromLeader(leaderID string, startIndex uint64) {
 
 	log.Printf("Node %s: catchUp: contacting leader %s at %s starting from index %d", n.id, leaderID, leaderAddr, startIndex)
 
-	conn, err := grpc.NewClient(leaderAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := n.dialPeer(leaderAddr)
 	if err != nil {
 		log.Printf("Node %s: catchUp: failed to connect to leader: %v", n.id, err)
 		return
 	}
-	defer conn.Close()
 
 	client := proto.NewReplicationClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -850,6 +889,7 @@ func (n *Node) catchUpFromLeader(leaderID string, startIndex uint64) {
 	})
 	if err != nil {
 		log.Printf("Node %s: catchUp: SyncWAL from leader failed: %v", n.id, err)
+		n.resetConn(leaderAddr)
 		return
 	}
 
@@ -904,12 +944,11 @@ func (n *Node) Join(ctx context.Context, req *proto.JoinRequest) (*proto.JoinRes
 			continue
 		}
 		go func(pID string, pAddr string) {
-			conn, err := grpc.NewClient(pAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err := n.dialPeer(pAddr)
 			if err != nil {
 				log.Printf("Node %s (Leader): Failed to connect to follower %s for UpdatePeers: %v", n.id, pID, err)
 				return
 			}
-			defer conn.Close()
 
 			client := proto.NewReplicationClient(conn)
 			ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
@@ -924,6 +963,7 @@ func (n *Node) Join(ctx context.Context, req *proto.JoinRequest) (*proto.JoinRes
 			})
 			if err != nil {
 				log.Printf("Node %s (Leader): Failed to UpdatePeers on follower %s: %v", n.id, pID, err)
+				n.resetConn(pAddr)
 			}
 		}(peerID, peerAddr)
 	}
@@ -953,12 +993,11 @@ func (n *Node) Join(ctx context.Context, req *proto.JoinRequest) (*proto.JoinRes
 			})
 		}
 
-		conn, err := grpc.NewClient(newNodeAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := n.dialPeer(newNodeAddr)
 		if err != nil {
 			log.Printf("Node %s (Leader): Failed to connect to new node %s (%s) for WAL sync: %v", n.id, newNodeID, newNodeAddr, err)
 			return
 		}
-		defer conn.Close()
 
 		n.mu.RLock()
 		term := n.currentTerm
@@ -977,6 +1016,7 @@ func (n *Node) Join(ctx context.Context, req *proto.JoinRequest) (*proto.JoinRes
 		})
 		if err != nil {
 			log.Printf("Node %s (Leader): WAL sync to new node %s failed: %v", n.id, newNodeID, err)
+			n.resetConn(newNodeAddr)
 		} else {
 			log.Printf("Node %s (Leader): WAL sync to new node %s succeeded (sent %d entries, response term: %d, success: %v)",
 				n.id, newNodeID, len(pbEntries), res.Term, res.Success)
@@ -1006,12 +1046,11 @@ func (n *Node) Leave(ctx context.Context, req *proto.LeaveRequest) (*proto.Leave
 	// Broadcast the membership change to other followers
 	for peerID, peerAddr := range n.peers {
 		go func(pID string, pAddr string) {
-			conn, err := grpc.NewClient(pAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err := n.dialPeer(pAddr)
 			if err != nil {
 				log.Printf("Node %s (Leader): Failed to connect to follower %s for UpdatePeers: %v", n.id, pID, err)
 				return
 			}
-			defer conn.Close()
 
 			client := proto.NewReplicationClient(conn)
 			ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
@@ -1026,6 +1065,7 @@ func (n *Node) Leave(ctx context.Context, req *proto.LeaveRequest) (*proto.Leave
 			})
 			if err != nil {
 				log.Printf("Node %s (Leader): Failed to UpdatePeers on follower %s: %v", n.id, pID, err)
+				n.resetConn(pAddr)
 			}
 		}(peerID, peerAddr)
 	}
