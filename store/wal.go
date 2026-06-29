@@ -28,17 +28,16 @@ type LogEntry struct {
 
 // WAL (Write-Ahead Log) manages our append-only persistence.
 type WAL struct {
-	mu   sync.Mutex
-	file *os.File
+	mu    sync.Mutex
+	file  *os.File
+	dirty bool // true if there are writes not yet fsynced to disk
 }
 
 // NewWAL opens or creates a WAL file.
+// Note: O_SYNC is intentionally omitted — we use group commit (periodic Sync calls)
+// instead of syncing on every write, which is far more throughput-friendly.
 func NewWAL(filepath string) (*WAL, error) {
-	// The flags here are the secret sauce of a WAL:
-	// os.O_APPEND: Any write is forced to the end of the file.
-	// os.O_SYNC: When we call Write(), it flushes directly to the physical disk (bypassing the OS cache),
-	// guaranteeing that if we return success, the data survives a power outage.
-	file, err := os.OpenFile(filepath, os.O_CREATE|os.O_RDWR|os.O_APPEND|os.O_SYNC, 0644)
+	file, err := os.OpenFile(filepath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -79,6 +78,9 @@ func (w *WAL) Append(entry LogEntry) error {
 
 	// 5. Append to the disk!
 	_, err := w.file.Write(buf)
+	if err == nil {
+		w.dirty = true
+	}
 	return err
 }
 
@@ -156,6 +158,21 @@ func (w *WAL) Replay() ([]LogEntry, error) {
 	}
 
 	return entries, nil
+}
+
+// Sync flushes any unsynced writes to disk. Called periodically by the store's
+// group-commit goroutine instead of syncing on every individual Append.
+func (w *WAL) Sync() error {
+	w.mu.Lock()
+	if !w.dirty {
+		w.mu.Unlock()
+		return nil
+	}
+	w.dirty = false
+	w.mu.Unlock()
+	// file.Sync() is called outside the mutex — it's slow (kernel fsync)
+	// and doesn't need to block concurrent Append calls.
+	return w.file.Sync()
 }
 
 // Close closes the file safely.

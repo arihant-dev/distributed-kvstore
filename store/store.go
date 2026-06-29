@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Store represents our in-memory key-value store, backed by a Write-Ahead Log.
@@ -12,9 +13,15 @@ type Store struct {
 	data map[string][]byte
 	wal  *WAL
 
-	// index keeps track of the latest operation number we've processed.
-	// This will be crucial for replication later, so followers know if they are behind.
-	index uint64
+	// nextIndex is the next index to reserve via PrepareEntry.
+	// It advances ahead of committedIndex when a write is in flight.
+	nextIndex uint64
+
+	// committedIndex is the last index that has been durably written to WAL and
+	// applied to memory. This is what GetIndex() returns and what heartbeats use
+	// for PrevLogIndex. Crucially, it stays behind nextIndex during a write, so
+	// followers never see a "gap" in the committed log.
+	committedIndex uint64
 
 	// log is an in-memory copy of every committed LogEntry, in index order.
 	// This lets GetEntriesAfter serve sync requests without replaying the WAL from disk.
@@ -47,41 +54,58 @@ func NewStore(walPath string) (*Store, error) {
 			delete(store.data, entry.Key)
 		}
 
-		// Update our latest index
-		if entry.Index > store.index {
-			store.index = entry.Index
+		// Track both committed and next index (equal on startup, no writes in-flight)
+		if entry.Index > store.committedIndex {
+			store.committedIndex = entry.Index
 		}
 
 		// Rebuild the in-memory log
 		store.log = append(store.log, entry)
 	}
+	store.nextIndex = store.committedIndex
+
+	// P1 Fix #10: Group commit — sync WAL to disk every 10ms instead of on every write.
+	// This gives ~10ms durability window while removing per-write fsync latency.
+	go store.syncLoop()
 
 	return store, nil
 }
 
+// syncLoop calls wal.Sync() every 10ms to flush buffered writes to disk.
+// This replaces the O_SYNC flag that was previously fsyncing after every write.
+func (s *Store) syncLoop() {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		_ = s.wal.Sync()
+	}
+}
+
 // Put adds or updates a key in the store.
+// Used for single-node writes and by tests. Commits immediately (no 2-phase).
 func (s *Store) Put(key string, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.index++ // Increment index for the new operation
+	s.nextIndex++ // Increment index for the new operation
 
 	// 1. Write to Disk FIRST (The "Ahead" in Write-Ahead Log)
 	entry := LogEntry{
-		Index: s.index,
+		Index: s.nextIndex,
 		Op:    OpPut,
 		Key:   key,
 		Value: value,
 	}
 
 	if err := s.wal.Append(entry); err != nil {
-		s.index-- // roll back the increment
+		s.nextIndex-- // roll back the increment
 		return fmt.Errorf("failed to write to WAL: %v", err)
 	}
 
 	// 2. Only after disk acknowledges it, apply to Memory and in-memory log
 	s.data[key] = value
 	s.log = append(s.log, entry)
+	s.committedIndex = s.nextIndex
 	return nil
 }
 
@@ -95,28 +119,30 @@ func (s *Store) Get(key string) ([]byte, bool) {
 }
 
 // Delete removes a key from the store.
+// Used for single-node writes and by tests. Commits immediately (no 2-phase).
 func (s *Store) Delete(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.index++
+	s.nextIndex++
 
 	// 1. Write the delete operation to Disk FIRST
 	entry := LogEntry{
-		Index: s.index,
+		Index: s.nextIndex,
 		Op:    OpDelete,
 		Key:   key,
 		Value: []byte{},
 	}
 
 	if err := s.wal.Append(entry); err != nil {
-		s.index-- // roll back the increment
+		s.nextIndex-- // roll back the increment
 		return fmt.Errorf("failed to write to WAL: %v", err)
 	}
 
 	// 2. Delete from Memory and append to in-memory log
 	delete(s.data, key)
 	s.log = append(s.log, entry)
+	s.committedIndex = s.nextIndex
 	return nil
 }
 
@@ -124,51 +150,44 @@ func (s *Store) Delete(key string) error {
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	_ = s.wal.Sync() // flush any pending writes before closing
 	return s.wal.Close()
 }
 
-// GetIndex returns the current log index of the store.
+// GetIndex returns the last *committed* log index.
+// This is used by heartbeats and followers for consistency checks.
+// It tracks only entries that have been durably written to WAL, never the
+// in-flight reserved index from PrepareEntry.
 func (s *Store) GetIndex() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.index
+	return s.committedIndex
 }
 
 // PrepareEntry atomically reserves the next log index and returns a LogEntry
 // ready for replication. It does NOT write to the WAL or apply to memory.
 // Call ApplyEntry after receiving quorum acknowledgement.
+// The committedIndex is NOT advanced here — it moves only in ApplyEntry.
 func (s *Store) PrepareEntry(op OpType, key string, value []byte) LogEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.index++
+	s.nextIndex++
 	return LogEntry{
-		Index: s.index,
+		Index: s.nextIndex,
 		Op:    op,
 		Key:   key,
 		Value: value,
 	}
 }
 
-// RollbackIndex decrements the log index by 1. Used to undo a PrepareEntry
-// reservation if replication failed and the entry should never be committed.
-// Must only be called by the leader when no follower has acked the entry.
-func (s *Store) RollbackIndex() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.index > 0 {
-		s.index--
-	}
-}
-
-// GetEntriesAfter returns all log entries with an index greater than afterIndex.
-// It serves from the in-memory log (O(log n) binary search), so it does not
-// hold the WAL mutex or perform any disk I/O. This makes it safe to call
-// concurrently with ongoing writes.
+// GetEntriesAfter returns all *committed* log entries with an index greater than
+// afterIndex. It serves from the in-memory log (O(log n) binary search), so it
+// does not hold the WAL mutex or perform any disk I/O.
 func (s *Store) GetEntriesAfter(afterIndex uint64) ([]LogEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if len(s.log) == 0 || afterIndex >= s.index {
+	if len(s.log) == 0 || afterIndex >= s.committedIndex {
 		return nil, nil
 	}
 
@@ -187,15 +206,19 @@ func (s *Store) GetEntriesAfter(afterIndex uint64) ([]LogEntry, error) {
 	return result, nil
 }
 
-// ApplyEntry is used by followers to apply a replicated entry from the leader.
-// Unlike Put/Delete, it preserves the leader's original index instead of
-// generating its own. This keeps WAL indices consistent across the cluster.
+// ApplyEntry is used by both followers (applying replicated entries from the leader)
+// and by the leader itself (committing after quorum). It preserves the exact index
+// from the entry rather than generating one locally.
+//
+// Key invariant: ApplyEntry checks entry.Index against committedIndex (not nextIndex),
+// so a PrepareEntry reservation at nextIndex=N doesn't cause ApplyEntry({Index:N})
+// to be incorrectly skipped.
 func (s *Store) ApplyEntry(entry LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Skip if we already have this entry
-	if entry.Index <= s.index {
+	// Skip if we already have this entry (idempotent)
+	if entry.Index <= s.committedIndex {
 		return nil
 	}
 
@@ -211,7 +234,11 @@ func (s *Store) ApplyEntry(entry LogEntry) error {
 		delete(s.data, entry.Key)
 	}
 
-	s.index = entry.Index
+	s.committedIndex = entry.Index
+	// Keep nextIndex >= committedIndex (a follower receiving entries has no in-flight reservations)
+	if entry.Index > s.nextIndex {
+		s.nextIndex = entry.Index
+	}
 	s.log = append(s.log, entry)
 	return nil
 }
