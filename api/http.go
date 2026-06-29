@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/arihant/kvstore/server"
 	"github.com/arihant/kvstore/store"
@@ -95,11 +96,12 @@ func (api *APIServer) handleStore(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Apply to our local WAL and memory
-			api.node.GetStore().Put(key, []byte(body["value"]))
+			// P0 Fix #1/#2: Reserve the log index WITHOUT writing to WAL yet.
+			// ReplicateEntry commits locally only after quorum acks.
+			entry := api.node.GetStore().PrepareEntry(store.OpPut, key, []byte(body["value"]))
 
-			// Trigger replication to followers!
-			if !api.node.ReplicateEntry(store.OpPut, key, []byte(body["value"])) {
+			if !api.node.ReplicateEntry(entry) {
+				// ReplicateEntry rolls back the index reservation on failure.
 				http.Error(w, "Failed to replicate write to majority of nodes", http.StatusInternalServerError)
 				return
 			}
@@ -109,11 +111,20 @@ func (api *APIServer) handleStore(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if r.Method == http.MethodDelete {
-			api.node.GetStore().Delete(key)
-			if !api.node.ReplicateEntry(store.OpDelete, key, nil) {
+			// P0 Fix #4: Return 404 if the key doesn't exist (matches API contract).
+			if _, exists := api.node.GetStore().Get(key); !exists {
+				http.Error(w, "Not Found", http.StatusNotFound)
+				return
+			}
+
+			// Reserve log index, replicate to quorum, then commit locally.
+			entry := api.node.GetStore().PrepareEntry(store.OpDelete, key, nil)
+
+			if !api.node.ReplicateEntry(entry) {
 				http.Error(w, "Failed to replicate delete to majority of nodes", http.StatusInternalServerError)
 				return
 			}
+
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -133,7 +144,8 @@ func (api *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// proxyRequest forwards an HTTP request to the Leader
+// proxyRequest forwards an HTTP request to the Leader.
+// P0 Fix #14: uses a 5s timeout so partitioned leaders don't hang goroutines.
 func (api *APIServer) proxyRequest(w http.ResponseWriter, r *http.Request, leaderAddr string) {
 	url := fmt.Sprintf("http://%s%s", leaderAddr, r.URL.Path)
 
@@ -146,7 +158,8 @@ func (api *APIServer) proxyRequest(w http.ResponseWriter, r *http.Request, leade
 
 	proxyReq.Header = r.Header
 
-	client := &http.Client{}
+	// P0 Fix #14: was &http.Client{} with no timeout — hangs forever when leader is partitioned.
+	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		http.Error(w, "Leader Unreachable", http.StatusBadGateway)

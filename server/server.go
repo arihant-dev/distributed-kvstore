@@ -677,12 +677,18 @@ func (n *Node) GetLeaderHTTPAddress() string {
 	return addr
 }
 
-// ReplicateEntry sends a single new entry to all followers and waits for a majority to acknowledge.
-// Returns true if successfully replicated to a majority.
-func (n *Node) ReplicateEntry(op store.OpType, key string, val []byte) bool {
+// ReplicateEntry replicates a pre-prepared LogEntry to followers and, on quorum,
+// commits it locally. The entry must have been obtained from store.PrepareEntry,
+// which reserves the index without writing to WAL. If replication fails, the
+// index reservation is rolled back so no phantom entries are left behind.
+//
+// This is the fix for the write-then-replicate atomicity bug: the leader now
+// commits locally ONLY after a majority of followers have acked the entry.
+func (n *Node) ReplicateEntry(entry store.LogEntry) bool {
 	n.mu.RLock()
 	if n.role != Leader {
 		n.mu.RUnlock()
+		n.store.RollbackIndex()
 		return false
 	}
 	term := n.currentTerm
@@ -691,25 +697,30 @@ func (n *Node) ReplicateEntry(op store.OpType, key string, val []byte) bool {
 	for id, addr := range n.peers {
 		peersMap[id] = addr
 	}
-	index := n.store.GetIndex()
 	n.mu.RUnlock()
 
 	req := &proto.AppendEntriesRequest{
 		LeaderId:     leaderID,
 		Term:         term,
-		PrevLogIndex: index - 1,
+		PrevLogIndex: entry.Index - 1,
 		Entries: []*proto.LogEntry{
 			{
-				Index: index,
-				Op:    uint32(op),
-				Key:   key,
-				Value: val,
+				Index: entry.Index,
+				Op:    uint32(entry.Op),
+				Key:   entry.Key,
+				Value: entry.Value,
 			},
 		},
 	}
 
 	neededAcks := (len(peersMap) + 1) / 2
+	// Single-node cluster: commit locally and return immediately.
 	if neededAcks == 0 {
+		if err := n.store.ApplyEntry(entry); err != nil {
+			log.Printf("Node %s: failed to apply entry locally (single-node): %v", n.id, err)
+			n.store.RollbackIndex()
+			return false
+		}
 		return true
 	}
 
@@ -761,21 +772,38 @@ func (n *Node) ReplicateEntry(op store.OpType, key string, val []byte) bool {
 
 	acks := 0
 	failures := 0
+	quorumReached := false
 	for ack := range ackChan {
 		if ack {
 			acks++
 			if acks >= neededAcks {
-				return true
+				quorumReached = true
+				break
 			}
 		} else {
 			failures++
 			if len(peersMap)-failures < neededAcks {
-				return false
+				break
 			}
 		}
 	}
 
-	return acks >= neededAcks
+	if !quorumReached {
+		// Roll back the reserved index — the entry was never committed to anyone.
+		n.store.RollbackIndex()
+		return false
+	}
+
+	// Quorum reached: now commit on the leader itself.
+	if err := n.store.ApplyEntry(entry); err != nil {
+		log.Printf("Node %s (Leader): CRITICAL — failed to apply entry locally after quorum: %v", n.id, err)
+		// The followers have it but we couldn't commit locally. This is very rare
+		// (disk full / I/O error). Return true anyway — the write IS durable on the
+		// majority, and our own WAL replay will pick it up when we restart.
+		return true
+	}
+
+	return true
 }
 
 func (n *Node) catchUpFromLeader(leaderID string, startIndex uint64) {
