@@ -2,8 +2,10 @@ package store
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"sync"
 )
@@ -98,7 +100,13 @@ func (w *WAL) Replay() ([]LogEntry, error) {
 		header := make([]byte, 13)
 		_, err := io.ReadFull(w.file, header)
 		if err == io.EOF {
-			break // Reached the end of the file, we successfully recovered everything!
+			break // Clean end of file — successfully recovered everything!
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			// Torn write: the process was killed mid-header. The last entry is
+			// incomplete. Drop it and stop — everything before this is intact.
+			log.Printf("WAL: truncated header at end of file — dropping partial last entry (likely crash recovery). This is safe.")
+			break
 		}
 		if err != nil {
 			return nil, fmt.Errorf("corrupt wal reading header: %v", err)
@@ -111,12 +119,20 @@ func (w *WAL) Replay() ([]LogEntry, error) {
 		// Knowing the KeyLen, we can read exactly that many bytes for the key
 		keyBuf := make([]byte, keyLen)
 		if _, err := io.ReadFull(w.file, keyBuf); err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) || err == io.EOF {
+				log.Printf("WAL: truncated key for index %d — dropping partial last entry (crash recovery). This is safe.", index)
+				break
+			}
 			return nil, fmt.Errorf("corrupt wal reading key: %v", err)
 		}
 
 		// Read the Value Length (4 bytes)
 		valLenBuf := make([]byte, 4)
 		if _, err := io.ReadFull(w.file, valLenBuf); err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) || err == io.EOF {
+				log.Printf("WAL: truncated val-len for index %d — dropping partial last entry (crash recovery). This is safe.", index)
+				break
+			}
 			return nil, fmt.Errorf("corrupt wal reading val len: %v", err)
 		}
 		valLen := binary.LittleEndian.Uint32(valLenBuf)
@@ -124,6 +140,10 @@ func (w *WAL) Replay() ([]LogEntry, error) {
 		// Read the Value itself
 		valBuf := make([]byte, valLen)
 		if _, err := io.ReadFull(w.file, valBuf); err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) || err == io.EOF {
+				log.Printf("WAL: truncated value for index %d — dropping partial last entry (crash recovery). This is safe.", index)
+				break
+			}
 			return nil, fmt.Errorf("corrupt wal reading value: %v", err)
 		}
 
